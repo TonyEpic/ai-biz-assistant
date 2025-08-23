@@ -2,7 +2,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Tuple, Optional
 from pydantic import BaseModel
-import io, os, uuid, time, re
+import io, os, uuid, time, re, json
+from datetime import datetime, timezone
 import requests
 import fitz  # PyMuPDF
 from docx import Document as DocxDocument
@@ -19,16 +20,57 @@ app.add_middleware(
 )
 
 # --- Config / Env ---
-PERSIST_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "chroma")
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "..", "data")
+PERSIST_DIR = os.path.join(DATA_DIR, "chroma")
+METRICS_FILE = os.path.join(DATA_DIR, "metrics.json")
 os.makedirs(PERSIST_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
-USE_DISTANCE_THRESHOLD = 1.0  # slightly looser to reduce false negatives
+USE_DISTANCE_THRESHOLD = 1.0  # a bit looser
 
 # --- Chroma (persistent) ---
 client = chromadb.PersistentClient(path=PERSIST_DIR)
 collection = client.get_or_create_collection(name="documents")
+
+# ---------- Metrics (JSON store) ----------
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def _load_metrics():
+    if not os.path.exists(METRICS_FILE):
+        return {"totals": {"uploads": 0, "ask": 0, "email": 0, "errors": 0}, "events": []}
+    try:
+        with open(METRICS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"totals": {"uploads": 0, "ask": 0, "email": 0, "errors": 0}, "events": []}
+
+def _save_metrics(m):
+    # keep only last 200 events to avoid growing unbounded
+    m["events"] = m.get("events", [])[-200:]
+    with open(METRICS_FILE, "w", encoding="utf-8") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+
+def _inc_total(key: str, by: int = 1):
+    m = _load_metrics()
+    m["totals"][key] = int(m["totals"].get(key, 0)) + by
+    _save_metrics(m)
+
+def _log_event(ev: dict):
+    m = _load_metrics()
+    m.setdefault("events", []).append(ev)
+    _save_metrics(m)
+
+def _log_ok(kind: str, detail: dict, latency_ms: int):
+    _inc_total(kind, 1)
+    _log_event({"ts": _now_iso(), "type": kind, "ok": True, "latency_ms": latency_ms, **detail})
+
+def _log_err(kind: str, err: str, detail: dict, latency_ms: int = 0):
+    _inc_total("errors", 1)
+    _log_event({"ts": _now_iso(), "type": kind, "ok": False, "error": err, "latency_ms": latency_ms, **detail})
 
 # ---------- Utils ----------
 def _chunk_text(text: str, max_chars: int = 1000, overlap: int = 150) -> List[str]:
@@ -112,11 +154,7 @@ def _context_block_from_sources(sources: List[dict]) -> str:
         lines.append(f"[S{i} • {s['source']}] {s['snippet']}")
     return "\n\n".join(lines)
 
-def _parse_subject_body(text: str) -> Tuple[str, str]:
-    # Expect LLM to return:
-    # SUBJECT: ...
-    # BODY:
-    # ...
+def _parse_subject_body(text: str):
     subj = ""
     body = text.strip()
     m_subj = re.search(r"(?i)^\s*subject\s*:\s*(.+)$", text, re.MULTILINE)
@@ -125,7 +163,6 @@ def _parse_subject_body(text: str) -> Tuple[str, str]:
         subj = m_subj.group(1).strip()
     if m_body:
         body = m_body.group(1).strip()
-    # fallback: first line as subject if short
     if not subj:
         first_line = text.strip().splitlines()[0] if text.strip() else ""
         subj = first_line[:120]
@@ -139,7 +176,7 @@ class AskRequest(BaseModel):
 
 class DraftEmailRequest(BaseModel):
     goal: str
-    tone: str = "neutral"      # "neutral" | "professional" | "friendly" | "formal"
+    tone: str = "neutral"
     recipient: Optional[str] = None
     k: int = 4
     use_llm: bool = True
@@ -184,8 +221,15 @@ def debug_chunks():
                 break
     return {"chunks": sample}
 
+@app.get("/metrics")
+def get_metrics(last_n: int = 50):
+    m = _load_metrics()
+    events = m.get("events", [])[-max(1, min(last_n, 200)):]
+    return {"totals": m.get("totals", {}), "events": events}
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
+    t0 = time.time()
     try:
         raw = await file.read()
         if not raw:
@@ -212,6 +256,9 @@ async def upload_file(file: UploadFile = File(...)):
 
         _index_chunks(base_doc_id, file.filename, chunks)
 
+        latency = int((time.time() - t0) * 1000)
+        _log_ok("uploads", {"filename": file.filename, "doc_id": base_doc_id, "chunks": len(chunks)}, latency)
+
         return {
             "filename": file.filename,
             "doc_id": base_doc_id,
@@ -221,115 +268,123 @@ async def upload_file(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
+        latency = int((time.time() - t0) * 1000)
+        _log_err("uploads", str(e), {"filename": getattr(file, "filename", "unknown")}, latency)
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
 @app.post("/ask")
 def ask(req: AskRequest):
-    if not req.query or not req.query.strip():
-        raise HTTPException(status_code=400, detail="Query is empty.")
-    if _collection_empty():
-        return {"answer": "No documents are indexed yet. Upload a file first.", "sources": [], "latency_ms": 0}
-
     t0 = time.time()
-    sources, dists = _query_chroma(req.query, req.k)
-    if not sources or (dists and dists[0] > USE_DISTANCE_THRESHOLD):
-        return {
-            "answer": "I don't have enough relevant context in the indexed documents to answer that.",
-            "sources": sources,
-            "latency_ms": int((time.time() - t0) * 1000),
-        }
-
-    if not req.use_llm:
-        extractive = "Here are the most relevant excerpts:\n" + "\n".join(
-            [f"• {s['snippet']} [{s['source']}]" for s in sources[:3]]
-        )
-        return {"answer": extractive, "sources": sources, "latency_ms": int((time.time() - t0) * 1000)}
-
-    context_block = _context_block_from_sources(sources)
-    system_preamble = (
-        "You are a precise assistant. Only answer using the provided CONTEXT. "
-        "If the answer is not in the context, say you don't know. "
-        "Cite sources inline like [S1], [S2] matching the context items."
-    )
-    prompt = f"{system_preamble}\n\nQUESTION: {req.query}\n\nCONTEXT:\n{context_block}\n\nFINAL ANSWER (with inline citations):"
     try:
-        answer = _call_ollama(prompt, temperature=0.1)
-    except Exception as e:
-        extractive = "LLM unavailable. Showing relevant excerpts instead:\n" + "\n".join(
-            [f"• {s['snippet']} [{s['source']}]" for s in sources[:3]]
-        )
-        return {"answer": extractive + f"\n\n(Note: LLM error: {e})", "sources": sources, "latency_ms": int((time.time() - t0) * 1000)}
+        if not req.query or not req.query.strip():
+            raise HTTPException(status_code=400, detail="Query is empty.")
+        if _collection_empty():
+            return {"answer": "No documents are indexed yet. Upload a file first.", "sources": [], "latency_ms": 0}
 
-    unique_sources = sorted({s["source"] for s in sources})
-    answer = answer.strip() + "\n\nSources: " + ", ".join(unique_sources)
-    return {"answer": answer, "sources": sources, "latency_ms": int((time.time() - t0) * 1000)}
+        sources, dists = _query_chroma(req.query, req.k)
+        if not sources or (dists and dists[0] > USE_DISTANCE_THRESHOLD):
+            latency = int((time.time() - t0) * 1000)
+            _log_ok("ask", {"query": req.query, "use_llm": req.use_llm, "matched": False, "top_dist": float(dists[0]) if dists else None}, latency)
+            return {
+                "answer": "I don't have enough relevant context in the indexed documents to answer that.",
+                "sources": sources,
+                "latency_ms": latency,
+            }
+
+        if not req.use_llm:
+            extractive = "Here are the most relevant excerpts:\n" + "\n".join(
+                [f"• {s['snippet']} [{s['source']}]" for s in sources[:3]]
+            )
+            latency = int((time.time() - t0) * 1000)
+            _log_ok("ask", {"query": req.query, "use_llm": False, "matched": True, "top_dist": float(dists[0])}, latency)
+            return {"answer": extractive, "sources": sources, "latency_ms": latency}
+
+        context_block = _context_block_from_sources(sources)
+        system_preamble = (
+            "You are a precise assistant. Only answer using the provided CONTEXT. "
+            "If the answer is not in the context, say you don't know. "
+            "Cite sources inline like [S1], [S2] matching the context items."
+        )
+        prompt = f"{system_preamble}\n\nQUESTION: {req.query}\n\nCONTEXT:\n{context_block}\n\nFINAL ANSWER (with inline citations):"
+        answer = _call_ollama(prompt, temperature=0.1)
+
+        unique_sources = sorted({s["source"] for s in sources})
+        answer = answer.strip() + "\n\nSources: " + ", ".join(unique_sources)
+
+        latency = int((time.time() - t0) * 1000)
+        _log_ok("ask", {"query": req.query, "use_llm": True, "matched": True, "top_dist": float(dists[0])}, latency)
+        return {"answer": answer, "sources": sources, "latency_ms": latency}
+    except HTTPException:
+        raise
+    except Exception as e:
+        latency = int((time.time() - t0) * 1000)
+        _log_err("ask", str(e), {"query": req.query, "use_llm": req.use_llm}, latency)
+        raise HTTPException(status_code=500, detail=f"Ask failed: {e}")
 
 @app.post("/draft-email")
 def draft_email(req: DraftEmailRequest):
-    if not req.goal or not req.goal.strip():
-        raise HTTPException(status_code=400, detail="Goal is empty.")
-    if _collection_empty():
-        # No docs? Still compose a generic email.
-        subject = f"{req.goal.strip()[:80]}"
-        body = (
-            f"Hi{(' ' + req.recipient) if req.recipient else ''},\n\n"
-            f"{req.goal.strip()}.\n\n"
-            f"Best regards,\n"
-            f"{'Your team' if not req.recipient else req.recipient.split('@')[0]}"
-        )
-        return {"subject": subject, "body": body, "sources": [], "latency_ms": 0}
-
     t0 = time.time()
-    # Use the goal as the retrieval query
-    sources, dists = _query_chroma(req.goal, req.k)
-    context_block = _context_block_from_sources(sources) if sources else ""
-
-    # If LLM disabled or unavailable, craft a clean template using snippets
-    if not req.use_llm:
-        bullets = "\n".join([f"- {s['snippet']}" for s in sources[:3]]) if sources else "- (no context snippets)"
-        subject = f"{req.goal.strip()[:80]}"
-        body = (
-            f"Hi{(' ' + req.recipient) if req.recipient else ''},\n\n"
-            f"{req.goal.strip()}.\n\n"
-            f"Key points:\n{bullets}\n\n"
-            f"Regards,\nYour team"
-        )
-        return {"subject": subject, "body": body, "sources": sources, "latency_ms": int((time.time() - t0) * 1000)}
-
-    # Compose LLM prompt
-    style = {
-        "neutral": "neutral and concise",
-        "professional": "professional and concise",
-        "friendly": "friendly and approachable",
-        "formal": "formal and clear",
-    }.get(req.tone.lower(), "neutral and concise")
-
-    system_preamble = (
-        "You write concise, actionable emails. "
-        "Use ONLY the provided CONTEXT; do not invent facts. "
-        "If key details are missing, add a short TODO line for the sender to fill in."
-    )
-    user_instruction = (
-        f"Goal: {req.goal}\n"
-        f"Recipient: {req.recipient or 'N/A'}\n"
-        f"Tone: {style}\n\n"
-        f"CONTEXT:\n{context_block}\n\n"
-        "Return exactly two sections with these headers:\n"
-        "SUBJECT: <one line>\n"
-        "BODY: <email body in 1-2 short paragraphs, include a clear next step>"
-    )
     try:
+        if not req.goal or not req.goal.strip():
+            raise HTTPException(status_code=400, detail="Goal is empty.")
+        if _collection_empty():
+            subject = f"{req.goal.strip()[:80]}"
+            body = (
+                f"Hi{(' ' + req.recipient) if req.recipient else ''},\n\n"
+                f"{req.goal.strip()}.\n\n"
+                f"Best regards,\n"
+                f"{'Your team' if not req.recipient else req.recipient.split('@')[0]}"
+            )
+            latency = int((time.time() - t0) * 1000)
+            _log_ok("email", {"goal": req.goal, "use_llm": req.use_llm, "matched": False}, latency)
+            return {"subject": subject, "body": body, "sources": [], "latency_ms": latency}
+
+        sources, dists = _query_chroma(req.goal, req.k)
+        context_block = _context_block_from_sources(sources) if sources else ""
+
+        if not req.use_llm:
+            bullets = "\n".join([f"- {s['snippet']}" for s in sources[:3]]) if sources else "- (no context snippets)"
+            subject = f"{req.goal.strip()[:80]}"
+            body = (
+                f"Hi{(' ' + req.recipient) if req.recipient else ''},\n\n"
+                f"{req.goal.strip()}.\n\n"
+                f"Key points:\n{bullets}\n\n"
+                f"Regards,\nYour team"
+            )
+            latency = int((time.time() - t0) * 1000)
+            _log_ok("email", {"goal": req.goal, "use_llm": False, "matched": bool(sources)}, latency)
+            return {"subject": subject, "body": body, "sources": sources, "latency_ms": latency}
+
+        style = {
+            "neutral": "neutral and concise",
+            "professional": "professional and concise",
+            "friendly": "friendly and approachable",
+            "formal": "formal and clear",
+        }.get(req.tone.lower(), "neutral and concise")
+
+        system_preamble = (
+            "You write concise, actionable emails. "
+            "Use ONLY the provided CONTEXT; do not invent facts. "
+            "If key details are missing, add a short TODO line for the sender to fill in."
+        )
+        user_instruction = (
+            f"Goal: {req.goal}\n"
+            f"Recipient: {req.recipient or 'N/A'}\n"
+            f"Tone: {style}\n\n"
+            f"CONTEXT:\n{context_block}\n\n"
+            "Return exactly two sections with these headers:\n"
+            "SUBJECT: <one line>\n"
+            "BODY: <email body in 1-2 short paragraphs, include a clear next step>"
+        )
         llm_text = _call_ollama(f"{system_preamble}\n\n{user_instruction}", temperature=0.2)
         subject, body = _parse_subject_body(llm_text)
-    except Exception as e:
-        # Fallback: deterministic template
-        bullets = "\n".join([f"- {s['snippet']}" for s in sources[:3]]) if sources else "- (no context snippets)"
-        subject = f"{req.goal.strip()[:80]}"
-        body = (
-            f"Hi{(' ' + req.recipient) if req.recipient else ''},\n\n"
-            f"{req.goal.strip()}.\n\n"
-            f"Key points:\n{bullets}\n\n"
-            f"Regards,\nYour team\n\n(Note: LLM error: {e})"
-        )
 
-    return {"subject": subject, "body": body, "sources": sources, "latency_ms": int((time.time() - t0) * 1000)}
+        latency = int((time.time() - t0) * 1000)
+        _log_ok("email", {"goal": req.goal, "use_llm": True, "matched": bool(sources)}, latency)
+        return {"subject": subject, "body": body, "sources": sources, "latency_ms": latency}
+    except HTTPException:
+        raise
+    except Exception as e:
+        latency = int((time.time() - t0) * 1000)
+        _log_err("email", str(e), {"goal": req.goal, "use_llm": req.use_llm}, latency)
+        raise HTTPException(status_code=500, detail=f"Email draft failed: {e}")

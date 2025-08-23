@@ -1,13 +1,12 @@
 import streamlit as st
 import requests
-import json
 
 BACKEND = "http://127.0.0.1:8000"
 
 st.set_page_config(page_title="AI Business Assistant", page_icon="🗂️")
 st.title("AI Business Assistant")
 
-# -------- Upload --------
+# -------- 1) Upload --------
 st.subheader("1) Upload documents")
 uploaded_files = st.file_uploader("Upload PDF, DOCX, or CSV", type=["pdf", "docx", "csv"], accept_multiple_files=True)
 if uploaded_files and st.button("Process Uploads"):
@@ -22,7 +21,7 @@ if uploaded_files and st.button("Process Uploads"):
 
 st.divider()
 
-# -------- Ask --------
+# -------- 2) Ask --------
 st.subheader("2) Ask a question")
 query = st.text_input("Question about your documents:")
 col1, col2, col3 = st.columns([1,1,2])
@@ -51,9 +50,9 @@ if st.button("Get Answer"):
 
 st.divider()
 
-# -------- Draft Email --------
+# -------- 3) Draft Email --------
 st.subheader("3) Draft email")
-goal = st.text_input("Goal (what should the email achieve?)", placeholder="Inform the team about the prototype deadline and ask for status.")
+goal = st.text_input("Goal", placeholder="Inform the team about the prototype deadline and request status.")
 tone = st.selectbox("Tone", ["neutral", "professional", "friendly", "formal"], index=1)
 recipient = st.text_input("Recipient (optional)", placeholder="team@example.com")
 ek = st.number_input("Top-K context", min_value=1, max_value=8, value=4, step=1)
@@ -74,12 +73,9 @@ if st.button("Generate Email"):
                 st.text_input("subject_out", value=subj, label_visibility="collapsed")
                 st.markdown("**Body**")
                 st.text_area("body_out", value=body, height=220, label_visibility="collapsed")
-
-                # Download as .txt
-                download_text = f"Subject: {subj}\n\n{body}"
-                st.download_button("Download email (.txt)", data=download_text.encode("utf-8"), file_name="email_draft.txt")
-
-                # Show sources (optional)
+                # Download
+                st.download_button("Download email (.txt)", data=f"Subject: {subj}\n\n{body}".encode("utf-8"), file_name="email_draft.txt")
+                # Sources
                 if data.get("sources"):
                     st.markdown("**Context used**")
                     for i, s in enumerate(data["sources"][:3], start=1):
@@ -91,13 +87,14 @@ if st.button("Generate Email"):
 
 st.divider()
 
-# -------- Debug --------
-st.subheader("Debug")
+# -------- 4) Analytics --------
+st.subheader("4) Analytics")
 cols = st.columns(3)
 with cols[0]:
-    if st.button("Count indexed chunks"):
+    if st.button("Refresh metrics"):
         try:
-            st.info(requests.get(f"{BACKEND}/debug_count", timeout=10).json())
+            m = requests.get(f"{BACKEND}/metrics?last_n=50", timeout=10).json()
+            st.session_state["metrics"] = m
         except Exception as e:
             st.error(e)
 with cols[1]:
@@ -112,3 +109,19 @@ with cols[2]:
             st.info(requests.get(f"{BACKEND}/llm_health", timeout=10).json())
         except Exception as e:
             st.error(e)
+
+m = st.session_state.get("metrics")
+if m:
+    totals = m.get("totals", {})
+    st.write("**Totals**", totals)
+    st.write("**Recent events**")
+    events = m.get("events", [])
+    # Show a compact table
+    if events:
+        import pandas as pd  # streamlit side import is fine
+        df = pd.DataFrame(events)
+        st.dataframe(df[["ts","type","ok","latency_ms","query","goal","filename","error","top_dist"]].fillna(""), height=260)
+    else:
+        st.info("No events logged yet.")
+else:
+    st.caption("Click 'Refresh metrics' to load usage stats.")
