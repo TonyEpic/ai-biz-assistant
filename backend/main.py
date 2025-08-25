@@ -210,16 +210,24 @@ def debug_count():
 
 @app.get("/debug_chunks")
 def debug_chunks():
-    items = collection.get(include=["documents", "metadatas"])
-    docs = items.get("documents", [])
-    metas = items.get("metadatas", [])
-    sample = []
-    for doc_list, meta_list in zip(docs, metas):
-        for text, m in zip(doc_list, meta_list):
-            sample.append({"doc_id": m.get("doc_id"), "source": m.get("source"), "snippet": text[:200]})
-            if len(sample) >= 5:
-                break
-    return {"chunks": sample}
+    try:
+        items = collection.get(include=["documents", "metadatas"])
+        docs = items.get("documents", [])
+        metas = items.get("metadatas", [])
+        sample = []
+        for doc_list, meta_list in zip(docs, metas):
+            for text, m in zip(doc_list, meta_list):
+                sample.append({
+                    "doc_id": m.get("doc_id"),
+                    "source": m.get("source"),
+                    "snippet": (text or "")[:200]
+                })
+                if len(sample) >= 5:
+                    break
+        return {"chunks": sample}
+    except Exception as e:
+        return {"error": str(e), "chunks": []}
+
 
 @app.get("/metrics")
 def get_metrics(last_n: int = 50):

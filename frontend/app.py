@@ -100,9 +100,14 @@ with cols[0]:
 with cols[1]:
     if st.button("Show sample chunks"):
         try:
-            st.info(requests.get(f"{BACKEND}/debug_chunks", timeout=10).json())
+            r = requests.get(f"{BACKEND}/debug_chunks", timeout=10)
+            if r.status_code == 200:
+                st.json(r.json())
+            else:
+                st.error(f"Backend returned {r.status_code}: {r.text}")
         except Exception as e:
             st.error(e)
+
 with cols[2]:
     if st.button("LLM health"):
         try:
@@ -120,7 +125,10 @@ if m:
     if events:
         import pandas as pd  # streamlit side import is fine
         df = pd.DataFrame(events)
-        st.dataframe(df[["ts","type","ok","latency_ms","query","goal","filename","error","top_dist"]].fillna(""), height=260)
+        cols_wanted = ["ts","type","ok","latency_ms","query","goal","filename","error","top_dist"]
+        df_display = df.reindex(columns=cols_wanted, fill_value="")
+        st.dataframe(df_display, height=260)
+
     else:
         st.info("No events logged yet.")
 else:
